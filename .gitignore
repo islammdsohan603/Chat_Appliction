@@ -1,0 +1,12 @@
+.env
+.node_modules
+.vercel
+.agent
+.vscode
+.env.example
+.env
+
+.env
+.env.local
+.env.development
+.env.production
