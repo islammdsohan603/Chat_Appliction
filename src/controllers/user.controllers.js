@@ -22,19 +22,27 @@ export const getCurrentUser = async (req, res) => {
 
 export const editProfile = async (req, res) => {
   try {
-    let { name } = req.body;
-    let image;
+    const { name, bio } = req.body;
+    const updateData = {};
+
+    if (name !== undefined) updateData.name = name;
+    if (bio !== undefined) updateData.bio = bio;
+
     if (req.file) {
-      image = await uploadOnCloudinary(req.file.path);
+      const imageUrl = await uploadOnCloudinary(req.file.path);
+      if (imageUrl) {
+        updateData.image = imageUrl;
+      }
     }
 
-    let user = await User.findByIdAndUpdate(req.userId, {
-      name,
-      image,
-    });
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      { $set: updateData },
+      { new: true }
+    ).select("-password");
 
     if (!user) {
-      return status(400).json({
+      return res.status(400).json({
         message: "user not found",
       });
     }

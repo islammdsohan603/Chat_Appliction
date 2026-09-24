@@ -10,12 +10,20 @@ const uploadOnCloudinary = async (filePath) => {
   });
 
   try {
-    const uploadResult = await cloudinary.uploader(filePath);
-    fs.unlink(filePath);
+    if (!filePath) return null;
+    console.log("Starting upload for filePath:", filePath);
+    const uploadResult = await cloudinary.uploader.upload(filePath, {
+      resource_type: "auto",
+    });
+    console.log("Cloudinary Upload Success. URL:", uploadResult.secure_url);
+    fs.unlinkSync(filePath);
     return uploadResult.secure_url;
   } catch (error) {
-    fs.unlink(filePath);
-    console.log(error);
+    console.error("Cloudinary Upload Error:", error);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    return null;
   }
 };
 
