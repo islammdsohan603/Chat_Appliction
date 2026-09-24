@@ -20,6 +20,19 @@ export const getCurrentUser = async (req, res) => {
   }
 };
 
+export const getAllUsers = async (req, res) => {
+  try {
+    const currentUserId = req.userId;
+    const users = await User.find({ _id: { $ne: currentUserId } }).select("-password");
+    return res.status(200).json(users);
+  } catch (error) {
+    console.log(error);
+    return res.status(500).json({
+      message: "server error",
+    });
+  }
+};
+
 export const editProfile = async (req, res) => {
   try {
     const { name, bio } = req.body;
