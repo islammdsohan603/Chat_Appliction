@@ -19,3 +19,16 @@ export const isAuth = async (req, res, next) => {
     });
   }
 };
+
+export const optionalAuth = async (req, res, next) => {
+  try {
+    const token = req.cookies?.token;
+    if (token) {
+      const verifyToken = jwt.verify(token, process.env.JWT_SECRET);
+      req.userId = verifyToken.userId;
+    }
+  } catch {
+    // Non-blocking: continue as guest
+  }
+  next();
+};

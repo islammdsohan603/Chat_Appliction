@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import AiChat from "../models/aiChat.models.js";
 
 /**
  * Initializes GoogleGenAI client using server environment variable
@@ -34,29 +35,124 @@ const extractErrorMessage = (error) => {
 };
 
 /**
- * Stream AI Chat controller via Server-Sent Events (SSE)
+ * Save an AI chat message to the database
+ * POST /api/ai/message
+ */
+export const saveAiMessage = async (req, res) => {
+  try {
+    const { prompt, imageUrl, role, model } = req.body;
+    const userId = req.userId || null;
+
+    if (!role || (!prompt && !imageUrl)) {
+      return res.status(400).json({ error: "Role and prompt or image are required" });
+    }
+
+    const saved = await AiChat.create({
+      userId,
+      role,
+      prompt: prompt || "",
+      imageUrl: imageUrl || null,
+      model: model || "gemini-2.5-flash",
+    });
+
+    return res.status(201).json({ success: true, message: saved });
+  } catch (error) {
+    console.error("Save AI Message Error:", error);
+    return res.status(500).json({ error: "Failed to persist AI message" });
+  }
+};
+
+/**
+ * Get AI chat history from the database
+ * GET /api/ai/history
+ */
+export const getAiHistory = async (req, res) => {
+  try {
+    const userId = req.userId || null;
+    const query = userId ? { userId } : { userId: null };
+
+    // Fetch up to 50 recent messages sorted chronologically
+    const history = await AiChat.find(query).sort({ createdAt: 1 }).limit(50);
+
+    return res.status(200).json(history);
+  } catch (error) {
+    console.error("Get AI History Error:", error);
+    return res.status(500).json({ error: "Failed to fetch chat history" });
+  }
+};
+
+/**
+ * Clear AI chat history from the database
+ * DELETE /api/ai/history
+ */
+export const clearAiHistory = async (req, res) => {
+  try {
+    const userId = req.userId || null;
+    const query = userId ? { userId } : { userId: null };
+
+    await AiChat.deleteMany(query);
+
+    return res.status(200).json({ success: true, message: "Chat history cleared" });
+  } catch (error) {
+    console.error("Clear AI History Error:", error);
+    return res.status(500).json({ error: "Failed to clear chat history" });
+  }
+};
+
+/**
+ * Stream AI Chat controller via Server-Sent Events (SSE) with database persistence
  * POST /api/ai/chat/stream
- * Body: { prompt?: string, messages?: Array<{ role: string, content?: string, text?: string }>, model?: string, systemInstruction?: string }
+ * Body: { prompt?: string, imageUrl?: string, messages?: Array<{ role: string, content?: string, text?: string }>, model?: string, systemInstruction?: string }
  */
 export const streamAiChat = async (req, res) => {
   try {
-    const { prompt, messages, model, systemInstruction } = req.body;
+    const { prompt, imageUrl, messages, model, systemInstruction } = req.body;
+    const userId = req.userId || null;
 
-    if (!prompt && (!Array.isArray(messages) || messages.length === 0)) {
-      return res.status(400).json({ error: "A prompt or messages array is required" });
+    if (!prompt && !imageUrl && (!Array.isArray(messages) || messages.length === 0)) {
+      return res.status(400).json({ error: "A prompt, image, or messages array is required" });
+    }
+
+    // 1. Persist user input to database concurrently/before querying AI
+    const targetModel = model || "gemini-2.5-flash";
+    let userSavePromise = Promise.resolve();
+    if (prompt || imageUrl) {
+      userSavePromise = AiChat.create({
+        userId,
+        role: "user",
+        prompt: prompt || "",
+        imageUrl: imageUrl || null,
+        model: targetModel,
+      }).catch((dbErr) => {
+        console.error("Failed to persist user prompt:", dbErr);
+      });
     }
 
     const ai = getAIClient();
 
-    // Support both single prompt and multi-turn conversation history
+    // 2. Prepare multimodal contents for Gemini
     let contents;
-    if (Array.isArray(messages) && messages.length > 0) {
+    if (imageUrl && typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
+      // Multimodal: parse inline image data and pair with prompt
+      const [metaPart, base64Part] = imageUrl.split(";base64,");
+      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
+      contents = [
+        {
+          inlineData: {
+            data: base64Part,
+            mimeType,
+          },
+        },
+        prompt || "Analyze this image",
+      ];
+    } else if (Array.isArray(messages) && messages.length > 0) {
+      // Multi-turn conversation history
       contents = messages.map((m) => ({
         role: m.role === "assistant" || m.role === "model" ? "model" : "user",
         parts: [{ text: m.content || m.text || "" }],
       }));
     } else {
-      contents = prompt;
+      contents = prompt || "";
     }
 
     // Set Server-Sent Events (SSE) headers
@@ -75,31 +171,41 @@ export const streamAiChat = async (req, res) => {
     ].filter(Boolean);
 
     let stream = null;
-    for (const targetModel of candidateModels) {
+    let selectedModel = candidateModels[0];
+
+    for (const currentModel of candidateModels) {
       try {
         stream = await ai.models.generateContentStream({
-          model: targetModel,
+          model: currentModel,
           contents,
           config: systemInstruction ? { systemInstruction } : undefined,
         });
+        selectedModel = currentModel;
         break;
       } catch (modelErr) {
-        if (targetModel !== candidateModels[candidateModels.length - 1]) {
+        if (currentModel !== candidateModels[candidateModels.length - 1]) {
           continue;
         }
         throw modelErr;
       }
     }
 
+    // Await user message persistence
+    await userSavePromise;
+
     let isConnected = true;
     req.on("close", () => {
       isConnected = false;
     });
 
+    let accumulatedText = "";
+
+    // Stream text chunks to client
     for await (const chunk of stream) {
       if (!isConnected) break;
       const text = chunk.text;
       if (text) {
+        accumulatedText += text;
         res.write(`data: ${JSON.stringify({ text })}\n\n`);
       }
     }
@@ -107,6 +213,19 @@ export const streamAiChat = async (req, res) => {
     if (isConnected) {
       res.write("data: [DONE]\n\n");
       res.end();
+
+      // 3. Persist assistant response to database on completion
+      if (accumulatedText.trim()) {
+        AiChat.create({
+          userId,
+          role: "assistant",
+          prompt: accumulatedText.trim(),
+          imageUrl: null,
+          model: selectedModel,
+        }).catch((dbErr) => {
+          console.error("Failed to persist assistant response:", dbErr);
+        });
+      }
     }
   } catch (error) {
     const cleanError = extractErrorMessage(error);
