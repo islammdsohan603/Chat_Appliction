@@ -7,6 +7,7 @@ import connectDB from "./db/db.js";
 import authRouter from "./routes/auth.routes.js";
 import userRouter from "./routes/user.routes.js";
 import chatRouter from "./routes/chat.routes.js";
+import aiRouter from "./routes/ai.routes.js";
 
 dotenv.config();
 
@@ -46,6 +47,7 @@ app.use(cookieParser());
 app.use("/api/auth", authRouter);
 app.use("/api/user", userRouter);
 app.use("/api/chat", chatRouter);
+app.use("/api/ai", aiRouter);
 
 app.get("/", (req, res) => {
   res.send("Chat Application Backend is Running");
