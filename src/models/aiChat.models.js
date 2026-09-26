@@ -27,7 +27,7 @@ const aiChatSchema = new mongoose.Schema(
   },
   {
     timestamps: true,
-    collection: "ai_chats",
+    collection: "chats",
   }
 );
 

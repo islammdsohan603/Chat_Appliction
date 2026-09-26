@@ -1,0 +1,376 @@
+import mongoose from "mongoose";
+import { GoogleGenAI } from "@google/genai";
+import Conversation from "../models/conversation.models.js";
+import Message from "../models/message.models.js";
+
+/**
+ * Initializes GoogleGenAI client using server environment variable
+ */
+const getAIClient = () => {
+  const apiKey = process.env.GOOGLE_API_KEY || process.env.GOOGEL_API_KEY;
+  if (!apiKey) {
+    throw new Error("GOOGLE_API_KEY is not configured on the server");
+  }
+  return new GoogleGenAI({ apiKey });
+};
+
+/**
+ * Derives a clean conversation title from the first prompt (35-40 chars, word-bounded)
+ */
+export const deriveTitle = (prompt) => {
+  if (!prompt || typeof prompt !== "string") {
+    return "Image Analysis";
+  }
+
+  const clean = prompt.trim().replace(/\s+/g, " ");
+  if (clean.length <= 38) {
+    return clean || "New Conversation";
+  }
+
+  // Find last space before 38 characters to avoid cutting words
+  const truncated = clean.slice(0, 38);
+  const lastSpace = truncated.lastIndexOf(" ");
+  if (lastSpace > 20) {
+    return truncated.slice(0, lastSpace).trim() + "…";
+  }
+  return truncated.trim() + "…";
+};
+
+const extractErrorMessage = (error) => {
+  if (!error) return "An unexpected error occurred";
+  if (typeof error === "string") return error;
+  if (error.message) {
+    try {
+      const parsed = JSON.parse(error.message);
+      if (parsed.error?.message) {
+        try {
+          const nested = JSON.parse(parsed.error.message);
+          if (nested.error?.message) return nested.error.message;
+        } catch {
+          return parsed.error.message;
+        }
+      }
+    } catch {
+      return error.message;
+    }
+    return error.message;
+  }
+  return String(error);
+};
+
+/**
+ * Stream AI Chat for a Conversation via Server-Sent Events (SSE)
+ * POST /api/conversations/stream
+ * Body: { conversationId?: string, prompt?: string, imageUrl?: string, model?: string, systemInstruction?: string }
+ */
+export const streamConversationChat = async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+
+  const { conversationId, prompt, imageUrl, model, systemInstruction } = req.body;
+
+  if (!prompt && !imageUrl) {
+    return res.status(400).json({ error: "A prompt or image is required" });
+  }
+
+  const targetModel = model || "gemini-2.5-flash";
+  let activeConversation = null;
+  let isNewSession = false;
+
+  try {
+    // 1. Resolve or create Conversation
+    if (conversationId && conversationId !== "new") {
+      if (!mongoose.Types.ObjectId.isValid(conversationId)) {
+        return res.status(400).json({ error: "Invalid conversation ID format" });
+      }
+      activeConversation = await Conversation.findOne({
+        _id: conversationId,
+        userId,
+      });
+
+      if (!activeConversation) {
+        return res.status(404).json({ error: "Conversation not found or unauthorized" });
+      }
+    } else {
+      // Auto-create new conversation on first prompt submission
+      const derivedTitle = deriveTitle(prompt);
+      activeConversation = await Conversation.create({
+        userId,
+        title: derivedTitle,
+        model: targetModel,
+        lastMessage: prompt ? prompt.slice(0, 100) : "Image attachment",
+      });
+      isNewSession = true;
+    }
+
+    // 2. Step A: Persist user prompt immediately to MongoDB under this session
+    const userMessageContent = prompt || (imageUrl ? "[Image attachment]" : "");
+    const userMsg = await Message.create({
+      conversationId: activeConversation._id,
+      userId,
+      role: "user",
+      content: userMessageContent,
+      imageUrl: imageUrl || null,
+      model: targetModel,
+    });
+
+    // 3. Set SSE streaming headers
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    // 4. Step B: Emit session_created immediately if newly created
+    if (isNewSession) {
+      res.write(
+        `data: ${JSON.stringify({
+          type: "session_created",
+          conversation: {
+            _id: activeConversation._id,
+            title: activeConversation.title,
+            createdAt: activeConversation.createdAt,
+            updatedAt: activeConversation.updatedAt,
+            lastMessage: activeConversation.lastMessage,
+            model: activeConversation.model,
+          },
+          userMessageId: userMsg._id,
+        })}\n\n`
+      );
+    }
+
+    // 5. Retrieve sliding window of up to 20 historical messages for multi-turn context
+    const recentMessages = await Message.find({
+      conversationId: activeConversation._id,
+    })
+      .sort({ createdAt: 1 })
+      .limit(20)
+      .lean();
+
+    // Prepare contents for Gemini
+    const ai = getAIClient();
+    let contents;
+
+    if (imageUrl && typeof imageUrl === "string" && imageUrl.startsWith("data:")) {
+      const [metaPart, base64Part] = imageUrl.split(";base64,");
+      const mimeType = metaPart.replace("data:", "") || "image/jpeg";
+      contents = [
+        {
+          inlineData: {
+            data: base64Part,
+            mimeType,
+          },
+        },
+        prompt || "Analyze this image",
+      ];
+    } else if (recentMessages.length > 1) {
+      // Multi-turn context for Gemini
+      contents = recentMessages.map((m) => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content || "" }],
+      }));
+    } else {
+      contents = prompt || "";
+    }
+
+    // Model fallback chain: gemini-2.5-flash -> gemini-3.5-flash-lite -> gemini-flash-latest -> gemini-3.8-flash
+    const candidateModels = [
+      targetModel,
+      "gemini-3.5-flash-lite",
+      "gemini-flash-latest",
+      "gemini-3.8-flash",
+    ].filter(Boolean);
+
+    let stream = null;
+    let selectedModel = candidateModels[0];
+
+    for (const currentModel of candidateModels) {
+      try {
+        stream = await ai.models.generateContentStream({
+          model: currentModel,
+          contents,
+          config: systemInstruction ? { systemInstruction } : undefined,
+        });
+        selectedModel = currentModel;
+        break;
+      } catch (modelErr) {
+        if (currentModel !== candidateModels[candidateModels.length - 1]) {
+          continue;
+        }
+        throw modelErr;
+      }
+    }
+
+    let isConnected = true;
+    req.on("close", () => {
+      isConnected = false;
+    });
+
+    let accumulatedText = "";
+
+    // 6. Stream tokens to client
+    for await (const chunk of stream) {
+      if (!isConnected) break;
+      const text = chunk.text;
+      if (text) {
+        accumulatedText += text;
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      }
+    }
+
+    // 7. Step C: On completion, persist AI assistant response & update conversation
+    if (isConnected) {
+      res.write("data: [DONE]\n\n");
+      res.end();
+
+      if (accumulatedText.trim()) {
+        await Message.create({
+          conversationId: activeConversation._id,
+          userId,
+          role: "assistant",
+          content: accumulatedText.trim(),
+          imageUrl: null,
+          model: selectedModel,
+        });
+
+        await Conversation.findByIdAndUpdate(activeConversation._id, {
+          lastMessage: accumulatedText.trim().slice(0, 100),
+          updatedAt: new Date(),
+        });
+      }
+    }
+  } catch (error) {
+    const cleanError = extractErrorMessage(error);
+    console.error("Conversation Streaming Error:", cleanError);
+
+    if (res.headersSent) {
+      res.write(`data: ${JSON.stringify({ error: cleanError })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+    return res.status(500).json({ error: cleanError });
+  }
+};
+
+/**
+ * Get all conversations for the authenticated user
+ * GET /api/conversations
+ */
+export const getUserConversations = async (req, res) => {
+  try {
+    const userId = req.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const conversations = await Conversation.find({ userId })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    return res.status(200).json(conversations);
+  } catch (error) {
+    console.error("Get User Conversations Error:", error);
+    return res.status(500).json({ error: "Failed to fetch conversations" });
+  }
+};
+
+/**
+ * Get single conversation with its complete message history
+ * GET /api/conversations/:id
+ */
+export const getConversationById = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+
+    const conversation = await Conversation.findOne({ _id: id, userId }).lean();
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+
+    const messages = await Message.find({ conversationId: id, userId })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    return res.status(200).json({
+      conversation,
+      messages,
+    });
+  } catch (error) {
+    console.error("Get Conversation Error:", error);
+    return res.status(500).json({ error: "Failed to fetch conversation messages" });
+  }
+};
+
+/**
+ * Delete a conversation and all its messages
+ * DELETE /api/conversations/:id
+ */
+export const deleteConversation = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+
+    const conversation = await Conversation.findOne({ _id: id, userId });
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation not found or unauthorized" });
+    }
+
+    // Delete messages associated with this conversation
+    await Message.deleteMany({ conversationId: id });
+    await Conversation.deleteOne({ _id: id });
+
+    return res.status(200).json({
+      success: true,
+      message: "Conversation and messages deleted successfully",
+      conversationId: id,
+    });
+  } catch (error) {
+    console.error("Delete Conversation Error:", error);
+    return res.status(500).json({ error: "Failed to delete conversation" });
+  }
+};
+
+/**
+ * Explicitly create a new conversation (REST fallback)
+ * POST /api/conversations
+ */
+export const createConversation = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { title, model } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const conversation = await Conversation.create({
+      userId,
+      title: title?.trim() || "New Chat",
+      model: model || "gemini-2.5-flash",
+    });
+
+    return res.status(201).json({ success: true, conversation });
+  } catch (error) {
+    console.error("Create Conversation Error:", error);
+    return res.status(500).json({ error: "Failed to create conversation" });
+  }
+};
